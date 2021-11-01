@@ -23,6 +23,8 @@ from ...model.base import Model
 from ...data.dataset import DatasetH, TSDatasetH
 from ...data.dataset.handler import DataHandlerLP
 
+import time
+
 
 class TransformerModel(Model):
     def __init__(
@@ -68,6 +70,7 @@ class TransformerModel(Model):
             torch.manual_seed(self.seed)
 
         self.model = Transformer(d_feat, d_model, nhead, num_layers, dropout, self.device)
+        self.logger.info(f'param count:{sum([m.numel() for m in self.model.parameters()])}')
         if optimizer.lower() == "adam":
             self.train_optimizer = optim.Adam(self.model.parameters(), lr=self.lr, weight_decay=self.reg)
         elif optimizer.lower() == "gd":
@@ -176,11 +179,13 @@ class TransformerModel(Model):
         # train
         self.logger.info("training...")
         self.fitted = True
-
+        training_time = []
         for step in range(self.n_epochs):
             self.logger.info("Epoch%d:", step)
             self.logger.info("training...")
+            end = time.time()
             self.train_epoch(train_loader)
+            training_time.append(time.time() - end)
             self.logger.info("evaluating...")
             train_loss, train_score = self.test_epoch(train_loader)
             val_loss, val_score = self.test_epoch(valid_loader)
@@ -200,6 +205,7 @@ class TransformerModel(Model):
                     break
 
         self.logger.info("best score: %.6lf @ %d" % (best_score, best_epoch))
+        self.logger.info("training time : %.6lf " % (np.mean(training_time)))
         self.model.load_state_dict(best_param)
         torch.save(best_param, save_path)
 

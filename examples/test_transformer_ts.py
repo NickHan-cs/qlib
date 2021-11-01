@@ -85,7 +85,7 @@ task = {
             "lr": 0.0001,
             "early_stop": 5,
             "reg": 1e-3,
-            "seed": 5,
+            "seed": 2,
         },
     },
     "dataset": {

@@ -20,15 +20,12 @@ from ...model.base import Model
 from ...data.dataset import DatasetH, TSDatasetH
 from ...data.dataset.handler import DataHandlerLP
 
+import time
+
 
 def trunc_normal_(tensor, mean=0., std=1., a=-2., b=2.):
     def norm_cdf(x):
         return (1. + math.erf(x / math.sqrt(2.))) / 2.
-
-    if (mean < a - 2 * std) or (mean > b + 2 * std):
-        warnings.warn("mean is more than 2 std from [a, b] in nn.init.trunc_normal_. "
-                      "The distribution of values may be incorrect.",
-                      stacklevel=2)
 
     with torch.no_grad():
         l = norm_cdf((a - mean) / std)
@@ -214,9 +211,6 @@ class CosineLRScheduler(Scheduler):
 
         assert t_initial > 0
         assert lr_min >= 0
-        if t_initial == 1 and t_mul == 1 and decay_rate == 1:
-            _logger.warning("Cosine annealing scheduler will have no effect on the learning "
-                           "rate since t_initial = t_mul = eta_mul = 1.")
         self.t_initial = t_initial
         self.t_mul = t_mul
         self.lr_min = lr_min
@@ -290,8 +284,7 @@ class InformerModel(Model):
         d_model: int = 64,
         batch_size: int = 2048,
         nhead: int = 2,
-        e_layers: int = 3,
-        d_layers: int = 2,
+        num_layers: int = 3,
         d_ff: int = 64,
         factor: float = 5,
         dropout: float = 0,
@@ -303,6 +296,8 @@ class InformerModel(Model):
         optimizer="adam",
         max_grad_norm=None,
         reg=1e-3,
+        attn_type="prob",
+        distil=True,
         n_jobs=10,
         GPU=0,
         seed=None,
@@ -332,9 +327,10 @@ class InformerModel(Model):
             torch.manual_seed(self.seed)
 
         self.model = Informer(
-            d_feat=d_feat, d_model=d_model, nhead=nhead, e_layers=e_layers, dropout=dropout, device=None,
-            d_layers=d_layers, d_ff=d_ff, factor=factor,
+            d_feat=d_feat, d_model=d_model, nhead=nhead, num_layers=num_layers, dropout=dropout, device=None,
+            d_ff=d_ff, factor=factor, attn_type=attn_type, distil=distil,
         )
+        self.logger.info(f'param count:{sum([m.numel() for m in self.model.parameters()])}')
         if optimizer.lower() == "adam":
             self.train_optimizer = optim.Adam(self.model.parameters(), lr=self.lr, weight_decay=self.reg)
         elif optimizer.lower() == "gd":
@@ -462,11 +458,13 @@ class InformerModel(Model):
         # train
         self.logger.info("training...")
         self.fitted = True
-
+        training_time = []
         for step in range(self.n_epochs):
             self.logger.info("Epoch%d:", step)
             self.logger.info("training...")
+            end = time.time()
             self.train_epoch(step, train_loader)
+            training_time.append(time.time() - end)
             self.logger.info("evaluating...")
             train_loss, train_score = self.test_epoch(train_loader)
             val_loss, val_score = self.test_epoch(valid_loader)
@@ -489,6 +487,7 @@ class InformerModel(Model):
                     break
 
         self.logger.info("best score: %.6lf @ %d" % (best_score, best_epoch))
+        self.logger.info("training time : %.6lf " % (np.mean(training_time)))
         self.model.load_state_dict(best_param)
         torch.save(best_param, save_path)
 
@@ -528,179 +527,134 @@ class PositionalEncoding(nn.Module):
         self.register_buffer("pe", pe)
 
     def forward(self, x):
-        # [N, T, F]
         return x + self.pe[:, :x.size(1)]
 
 
+class FullAttention(nn.Module):
+    def __init__(self, scale=None, attn_drop=0.1):
+        super(FullAttention, self).__init__()
+        self.scale = scale
+        self.dropout = nn.Dropout(attn_drop)
+        
+    def forward(self, q, k, v, attn_mask=None):
+        _, _, _, E = q.shape
+        _, _, _, _ = v.shape
+        scale = self.scale or 1./math.sqrt(E)
+        scores = torch.einsum("blhe,bshe->bhls", q, k)
+        A = self.dropout(torch.softmax(scale * scores, dim=-1))
+        V = torch.einsum("bhls,bshd->blhd", A, v)
+        return V.contiguous()
+
+
 class ProbAttention(nn.Module):
-    def __init__(self, mask_flag=True, factor=5, scale=None, attention_dropout=0.1, output_attention=False):
+    def __init__(self, factor=5, scale=None, attn_drop=0.1):
         super(ProbAttention, self).__init__()
         self.factor = factor
         self.scale = scale
-        self.mask_flag = mask_flag
-        self.output_attention = output_attention
-        self.dropout = nn.Dropout(attention_dropout)
+        self.dropout = nn.Dropout(attn_drop)
 
-    def _prob_QK(self, Q, K, sample_k, n_top): # n_top: c*ln(L_q)
-        # Q [B, H, L, D]
+    def _prob_QK(self, Q, K, sample_k, n_top):
         B, H, L_K, E = K.shape
         _, _, L_Q, _ = Q.shape
-
-        # calculate the sampled Q_K
         K_expand = K.unsqueeze(-3).expand(B, H, L_Q, L_K, E)
-        index_sample = torch.randint(L_K, (L_Q, sample_k)) # real U = U_part(factor*ln(L_k))*L_q
+        index_sample = torch.randint(L_K, (L_Q, sample_k))
         K_sample = K_expand[:, :, torch.arange(L_Q).unsqueeze(1), index_sample, :]
         Q_K_sample = torch.matmul(Q.unsqueeze(-2), K_sample.transpose(-2, -1)).squeeze()
-
-        # find the Top_k query with sparisty measurement
         M = Q_K_sample.max(-1)[0] - torch.div(Q_K_sample.sum(-1), L_K)
         M_top = M.topk(n_top, sorted=False)[1]
-
-        # use the reduced Q to calculate Q_K
         Q_reduce = Q[torch.arange(B)[:, None, None],
                      torch.arange(H)[None, :, None],
-                     M_top, :] # factor*ln(L_q)
-        Q_K = torch.matmul(Q_reduce, K.transpose(-2, -1)) # factor*ln(L_q)*L_k
-
+                     M_top, :]
+        Q_K = torch.matmul(Q_reduce, K.transpose(-2, -1))
         return Q_K, M_top
 
     def _get_initial_context(self, V, L_Q):
-        B, H, L_V, D = V.shape
-        if not self.mask_flag:
-            # V_sum = V.sum(dim=-2)
-            V_sum = V.mean(dim=-2)
-            contex = V_sum.unsqueeze(-2).expand(B, H, L_Q, V_sum.shape[-1]).clone()
-        else: # use mask
-            assert(L_Q == L_V) # requires that L_Q == L_V, i.e. for self-attention only
-            contex = V.cumsum(dim=-2)
+        B, H, _, _ = V.shape
+        V_sum = V.mean(dim=-2)
+        contex = V_sum.unsqueeze(-2).expand(B, H, L_Q, V_sum.shape[-1]).clone()
         return contex
 
     def _update_context(self, context_in, V, scores, index, L_Q, attn_mask):
-        B, H, L_V, D = V.shape
-
-        if self.mask_flag:
-            attn_mask = ProbMask(B, H, L_Q, index, scores, device=V.device)
-            scores.masked_fill_(attn_mask.mask, -np.inf)
-
-        attn = torch.softmax(scores, dim=-1) # nn.Softmax(dim=-1)(scores)
-
+        B, H, _, _ = V.shape
+        attn = torch.softmax(scores, dim=-1)
         context_in[torch.arange(B)[:, None, None],
                    torch.arange(H)[None, :, None],
                    index, :] = torch.matmul(attn, V).type_as(context_in)
-        if self.output_attention:
-            attns = (torch.ones([B, H, L_V, L_V])/L_V).type_as(attn).to(attn.device)
-            attns[torch.arange(B)[:, None, None], torch.arange(H)[None, :, None], index, :] = attn
-            return (context_in, attns)
-        else:
-            return (context_in, None)
+        return context_in
 
-    def forward(self, queries, keys, values, attn_mask):
-        B, L_Q, H, D = queries.shape
-        _, L_K, _, _ = keys.shape
-
-        queries = queries.transpose(2,1)
-        keys = keys.transpose(2,1)
-        values = values.transpose(2,1)
-
-        U_part = self.factor * np.ceil(np.log(L_K)).astype('int').item() # c*ln(L_k)
-        u = self.factor * np.ceil(np.log(L_Q)).astype('int').item() # c*ln(L_q) 
-
-        U_part = U_part if U_part<L_K else L_K
-        u = u if u<L_Q else L_Q
-        
-        scores_top, index = self._prob_QK(queries, keys, sample_k=U_part, n_top=u) 
-
-        # add scale factor
+    def forward(self, q, k, v, attn_mask=None):
+        _, L_Q, _, D = q.shape
+        _, L_K, _, _ = k.shape
+        q = q.transpose(2,1)
+        k = k.transpose(2,1)
+        v = v.transpose(2,1)
+        U_part = self.factor * np.ceil(np.log(L_K)).astype('int').item()
+        u = self.factor * np.ceil(np.log(L_Q)).astype('int').item()
+        U_part = U_part if U_part < L_K else L_K
+        u = u if u < L_Q else L_Q
+        scores_top, index = self._prob_QK(q, k, sample_k=U_part, n_top=u) 
         scale = self.scale or 1./math.sqrt(D)
         if scale is not None:
             scores_top = scores_top * scale
-        # get the context
-        context = self._get_initial_context(values, L_Q)
-        # update the context with selected top_k queries
-        context, attn = self._update_context(context, values, scores_top, index, L_Q, attn_mask)
-        
-        return context.transpose(2,1).contiguous(), attn
+        context = self._get_initial_context(v, L_Q)
+        context = self._update_context(context, v, scores_top, index, L_Q, attn_mask)   
+        return context.transpose(2,1).contiguous()
 
 
-class AttentionLayer(nn.Module):
-    def __init__(self, attention, d_model, n_heads, 
-                 d_keys=None, d_values=None, mix=False):
-        super(AttentionLayer, self).__init__()
-
-        d_keys = d_keys or (d_model//n_heads)
-        d_values = d_values or (d_model//n_heads)
-
+class Attention(nn.Module):
+    def __init__(self, attention, d_model, nhead):
+        super(Attention, self).__init__()
         self.inner_attention = attention
-        self.query_projection = nn.Linear(d_model, d_keys * n_heads)
-        self.key_projection = nn.Linear(d_model, d_keys * n_heads)
-        self.value_projection = nn.Linear(d_model, d_values * n_heads)
-        self.out_projection = nn.Linear(d_values * n_heads, d_model)
-        self.n_heads = n_heads
-        self.mix = mix
+        self.q = nn.Linear(d_model, d_model)
+        self.k = nn.Linear(d_model, d_model)
+        self.v = nn.Linear(d_model, d_model)
+        self.proj = nn.Linear(d_model, d_model)
+        self.nhead = nhead
 
-    def forward(self, queries, keys, values, attn_mask):
-        B, L, _ = queries.shape
-        _, S, _ = keys.shape
-        H = self.n_heads
-
-        queries = self.query_projection(queries).view(B, L, H, -1)
-        keys = self.key_projection(keys).view(B, S, H, -1)
-        values = self.value_projection(values).view(B, S, H, -1)
-
-        out, attn = self.inner_attention(
-            queries,
-            keys,
-            values,
-            attn_mask
-        )
-        if self.mix:
-            out = out.transpose(2,1).contiguous()
+    def forward(self, q, k, v, attn_mask=None):
+        B, L, _ = q.shape
+        _, S, _ = k.shape
+        H = self.nhead
+        q = self.q(q).view(B, L, H, -1)
+        k = self.k(k).view(B, S, H, -1)
+        v = self.v(v).view(B, S, H, -1)
+        out = self.inner_attention(q, k, v, attn_mask)
         out = out.view(B, L, -1)
+        return self.proj(out)
 
-        return self.out_projection(out), attn
 
-
-class EncoderLayer(nn.Module):
-    def __init__(self, attention, d_model, d_ff=None, dropout=0.1):
-        super(EncoderLayer, self).__init__()
+class EncoderBlock(nn.Module):
+    def __init__(self, attn, d_model, d_ff=None, dropout=0.1):
+        super(EncoderBlock, self).__init__()
         d_ff = d_ff or 4*d_model
-        self.attention = attention
-        self.conv1 = nn.Conv1d(in_channels=d_model, out_channels=d_ff, kernel_size=1)
-        self.conv2 = nn.Conv1d(in_channels=d_ff, out_channels=d_model, kernel_size=1)
-        self.norm1 = nn.LayerNorm(d_model)
-        self.norm2 = nn.LayerNorm(d_model)
+        self.attn = attn
         self.dropout = nn.Dropout(dropout)
-        self.activation = F.gelu
+        self.norm1 = nn.LayerNorm(d_model)
+        self.conv1 = nn.Conv1d(in_channels=d_model, out_channels=d_ff, kernel_size=1)
+        self.act = F.gelu
+        self.conv2 = nn.Conv1d(in_channels=d_ff, out_channels=d_model, kernel_size=1)
+        self.norm2 = nn.LayerNorm(d_model)
 
     def forward(self, x, attn_mask=None):
-        # x [B, L, D]
-        # x = x + self.dropout(self.attention(
-        #     x, x, x,
-        #     attn_mask = attn_mask
-        # ))
-        new_x, attn = self.attention(
-            x, x, x,
-            attn_mask = attn_mask
-        )
-        x = x + self.dropout(new_x)
-
-        y = x = self.norm1(x)
-        y = self.dropout(self.activation(self.conv1(y.transpose(-1,1))))
+        x = self.norm1(x + self.dropout(self.attn(x, x, x, attn_mask=attn_mask)))
+        y = x
+        y = self.dropout(self.act(self.conv1(y.transpose(-1, 1))))
         y = self.dropout(self.conv2(y).transpose(-1,1))
-
-        return self.norm2(x+y), attn
+        return self.norm2(x + y)
 
 
 class ConvLayer(nn.Module):
-    def __init__(self, c_in):
+    def __init__(self, in_channels):
         super(ConvLayer, self).__init__()
         padding = 1 if torch.__version__>='1.5.0' else 2
-        self.downConv = nn.Conv1d(in_channels=c_in,
-                                  out_channels=c_in,
-                                  kernel_size=3,
-                                  padding=padding,
-                                  padding_mode='circular')
-        self.norm = nn.BatchNorm1d(c_in)
+        self.downConv = nn.Conv1d(
+            in_channels=in_channels,
+            out_channels=in_channels,
+            kernel_size=3,
+            padding=padding,
+            padding_mode='circular',
+        )
+        self.norm = nn.BatchNorm1d(in_channels)
         self.activation = nn.ELU()
         self.maxPool = nn.MaxPool1d(kernel_size=3, stride=2, padding=1)
 
@@ -721,83 +675,43 @@ class Encoder(nn.Module):
         self.norm = norm_layer
 
     def forward(self, x, attn_mask=None):
-        # x [B, L, D]
-        attns = []
         if self.conv_layers is not None:
             for attn_layer, conv_layer in zip(self.attn_layers, self.conv_layers):
-                x, attn = attn_layer(x, attn_mask=attn_mask)
+                x = attn_layer(x, attn_mask=attn_mask)
                 x = conv_layer(x)
-                attns.append(attn)
-            x, attn = self.attn_layers[-1](x, attn_mask=attn_mask)
-            attns.append(attn)
+            x = self.attn_layers[-1](x, attn_mask=attn_mask)
         else:
             for attn_layer in self.attn_layers:
-                x, attn = attn_layer(x, attn_mask=attn_mask)
-                attns.append(attn)
-
+                x = attn_layer(x, attn_mask=attn_mask)
         if self.norm is not None:
             x = self.norm(x)
-
-        return x, attns
+        return x
 
 
 class Informer(nn.Module):
-    def __init__(self, d_feat=6, d_model=8, nhead=4, e_layers=2, dropout=0.5, device=None,
-                 d_layers=2, d_ff=8, factor=5, mix=True):
+    def __init__(self, d_feat=6, d_model=8, nhead=4, num_layers=2, dropout=0.5, device=None,
+                 d_ff=8, factor=5, attn_type="prob", distil=True):
         super(Informer, self).__init__()
         self.feature_layer = nn.Linear(d_feat, d_model)
         self.pos_encoder = PositionalEncoding(d_model)
-
+        attn = ProbAttention(factor, attn_drop=dropout) if attn_type == "prob" else FullAttention(attn_drop=dropout)
         self.encoder = Encoder(
             [
-                EncoderLayer(
-                    AttentionLayer(
-                        ProbAttention(False, factor, attention_dropout=dropout), 
-                        d_model, nhead, mix=False
-                    ),
-                    d_model,
-                    d_ff,
-                    dropout=dropout,
-                ) for l in range(e_layers)
+                EncoderBlock(
+                    Attention(attn, d_model, nhead),
+                    d_model, d_ff, dropout=dropout,
+                ) for _ in range(num_layers)
             ],
-            [
-                ConvLayer(
-                    d_model
-                ) for l in range(e_layers-1)
-            ],
+            [ConvLayer(d_model) for _ in range(num_layers-1)] if distil else None,
             norm_layer=torch.nn.LayerNorm(d_model)
         )
-        # Decoder
-        # self.decoder = Decoder(
-        #     [
-        #         DecoderLayer(
-        #             AttentionLayer(
-        #                 ProbAttention(True, factor, attention_dropout=dropout), 
-        #                 d_model, n_heads, mix=mix
-        #             ),
-        #             AttentionLayer(
-        #                 FullAttention(False, factor, attention_dropout=dropout), 
-        #                 d_model, nhead, mix=False
-        #             ),
-        #             d_model,
-        #             d_ff,
-        #             dropout=dropout,
-        #         )
-        #         for l in range(d_layers)
-        #     ],
-        #     norm_layer=torch.nn.LayerNorm(d_model)
-        # )
-
         self.decoder_layer = nn.Linear(d_model, 1, bias=True)
-        self.device = device
         self.d_feat = d_feat
-
         self.apply(self._init_weights)
 
     def _init_weights(self, m):
         if isinstance(m, nn.Linear):
             trunc_normal_(m.weight, std=.02)
-            # nn.init.xavier_uniform_(m.weight)
             if m.bias is not None:
                 nn.init.zeros_(m.bias)
         elif isinstance(m, nn.LayerNorm):
@@ -811,11 +725,8 @@ class Informer(nn.Module):
         mask = None
 
         enc_out = self.pos_encoder(src)
-        enc_out, attns = self.encoder(enc_out, attn_mask=mask)
+        enc_out = self.encoder(enc_out, attn_mask=mask)
 
         output = self.decoder_layer(enc_out[:, -1, :])
-
-        # dec_out = self.decoder(src, enc_out)
-        # output = self.decoder_layer(dec_out[:, -1, :])
 
         return output.squeeze()
